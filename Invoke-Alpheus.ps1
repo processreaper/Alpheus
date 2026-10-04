@@ -38,8 +38,9 @@
     With ComponentStore, also pass /ResetBase (frees more; installed updates can no longer be uninstalled).
 
 .PARAMETER ConfigPath
-    Optional JSON file adding your own PROTECTED folders. Default: alpheus.config.json next to this
-    script. Missing file = built-in protections only; an unreadable file stops the run (fail closed).
+    Optional JSON file adding your own PROTECTED folders. Default: the first alpheus.config.json found
+    next to this script, then in %LOCALAPPDATA%\Alpheus (where Alpheus.exe users keep it). No file =
+    built-in protections only. An unreadable file, or a -ConfigPath that does not exist, stops the run.
 
 .PARAMETER Deep
     Also size every top-level folder on each fixed volume and run DISM /AnalyzeComponentStore. Slow.
@@ -63,7 +64,7 @@ param(
     [switch]$Deep,
     # Skip the extra crash-dump prompt (the GUI asks its own question first).
     [switch]$Force,
-    [string]$ConfigPath = (Join-Path $PSScriptRoot 'alpheus.config.json')
+    [string]$ConfigPath
 )
 
 Set-StrictMode -Version Latest
@@ -177,7 +178,18 @@ $OllamaModels = if ($env:OLLAMA_MODELS) { $env:OLLAMA_MODELS } else { Join-Path 
 # Your own PROTECTED folders (models, projects, vaults). Fail closed: if the file exists but cannot be
 # read, stop rather than run with protections silently missing.
 $UserProtected = @()
-if ($ConfigPath -and (Test-Path -LiteralPath $ConfigPath)) {
+if ($PSBoundParameters.ContainsKey('ConfigPath')) {
+    if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
+        Write-Host " -ConfigPath $ConfigPath does not exist. Refusing to run without the protections you asked for." -ForegroundColor Red
+        Stop-Transcript -ErrorAction SilentlyContinue -WhatIf:$false | Out-Null
+        exit 2
+    }
+} else {
+    $ConfigPath = @((Join-Path $PSScriptRoot 'alpheus.config.json'), (Join-Path $env:LOCALAPPDATA 'Alpheus\alpheus.config.json')) |
+        Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+}
+if ($ConfigPath) {
+    Write-Host " Config: $ConfigPath"
     try {
         $cfg = Get-Content -LiteralPath $ConfigPath -Raw -ErrorAction Stop | ConvertFrom-Json -AsHashtable -ErrorAction Stop
         foreach ($p in @($cfg['Protected'])) {

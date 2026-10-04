@@ -51,6 +51,15 @@ if ([Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') {
 
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Windows.Forms, System.Drawing   # Forms: monitor list for layout restore
 
+# Own taskbar identity: without it the window groups under pwsh.exe and shows the PowerShell icon.
+# Must be set before the first window exists. Cosmetic, so any failure is ignored.
+try {
+    if (-not ('Alpheus.Shell' -as [type])) {
+        Add-Type -Namespace Alpheus -Name Shell -MemberDefinition '[DllImport("shell32.dll", CharSet = CharSet.Unicode)] public static extern int SetCurrentProcessExplicitAppUserModelID(string id);'
+    }
+    [void][Alpheus.Shell]::SetCurrentProcessExplicitAppUserModelID('processreaper.Alpheus')
+} catch { Write-Verbose "AppUserModelID not set: $_" }
+
 # ---------------------------------------------------------------- disk scan engine (C#, compiled once per launch)
 $ScanSource = @'
 using System;
@@ -59,6 +68,7 @@ using System.Diagnostics;
 using System.IO;
 using System.IO.Enumeration;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -314,6 +324,25 @@ namespace Alpheus
             Sum(dir);
         }
 
+        // Remove a deleted node from the tree and recompute every ancestor (size, counts, sort order).
+        public static void Detach(Node n)
+        {
+            var p = n == null ? null : n.Parent;
+            if (p == null || p.Children == null || !p.Children.Remove(n)) return;
+            for (var a = p; a != null; a = a.Parent) Sum(a);
+        }
+
+        // True while n is still reachable from root (not inside a detached branch).
+        public static bool IsAttached(Node n, Node root)
+        {
+            for (var c = n; c != null; c = c.Parent)
+            {
+                if (ReferenceEquals(c, root)) return true;
+                if (c.Parent != null && !c.Parent.Children.Contains(c)) return false;
+            }
+            return false;
+        }
+
         public List<ExtStat> Extensions()
         {
             lock (gate) return exts.Values.OrderByDescending(e => e.Size).ToList();
@@ -334,6 +363,41 @@ namespace Alpheus
                 if (c.IsFile) { if (!c.IsAggregate) acc.Add(c); }
                 else Collect(c, acc);
             }
+        }
+    }
+
+    // Acheron: carries deleted items away. One SHFileOperation for the whole batch, so Windows shows a
+    // single progress window. Recycle: FOF_ALLOWUNDO + FOF_WANTNUKEWARNING, so anything Windows cannot
+    // recycle (too big for the bin) asks before it is destroyed instead of vanishing silently.
+    // Alpheus has already confirmed, hence FOF_NOCONFIRMATION (no per-item "are you sure").
+    public static class Acheron
+    {
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        struct SHFILEOPSTRUCT
+        {
+            public IntPtr hwnd; public uint wFunc;
+            [MarshalAs(UnmanagedType.LPWStr)] public string pFrom;
+            [MarshalAs(UnmanagedType.LPWStr)] public string pTo;
+            public ushort fFlags; public bool fAnyOperationsAborted; public IntPtr hNameMappings;
+            [MarshalAs(UnmanagedType.LPWStr)] public string lpszProgressTitle;
+        }
+        [DllImport("shell32.dll", CharSet = CharSet.Unicode)] static extern int SHFileOperation(ref SHFILEOPSTRUCT op);
+
+        const uint FO_DELETE = 3;
+        const ushort FOF_NOCONFIRMATION = 0x0010, FOF_ALLOWUNDO = 0x0040, FOF_WANTNUKEWARNING = 0x4000;
+
+        // Returns 0 on success; Aborted is true if the user cancelled in a Windows dialog.
+        public static int Delete(IntPtr owner, IList<string> paths, bool permanent, out bool aborted)
+        {
+            var op = new SHFILEOPSTRUCT
+            {
+                hwnd = owner, wFunc = FO_DELETE,
+                pFrom = string.Join("\0", paths) + "\0\0",
+                fFlags = (ushort)(FOF_NOCONFIRMATION | (permanent ? 0 : FOF_ALLOWUNDO | FOF_WANTNUKEWARNING))
+            };
+            int rc = SHFileOperation(ref op);
+            aborted = op.fAnyOperationsAborted;
+            return rc;
         }
     }
 
@@ -707,7 +771,7 @@ function New-CatXaml([string[]]$cats, [bool]$checked) {
             <TextBox Name="txtRoot" Text="C:\" Background="#262A33" Foreground="#E6E6E6" BorderBrush="#3A3F4B" Padding="6,4" VerticalContentAlignment="Center"/>
           </DockPanel>
           <TextBlock Name="lblScan" DockPanel.Dock="Top" Margin="10,0,10,8" Foreground="#B8C0CC" TextTrimming="CharacterEllipsis"
-                     Text="Pick a drive or folder and press Scan. Read-only: nothing on this tab deletes anything."/>
+                     Text="Pick a drive or folder and press Scan. Ctrl/Shift-click to select several; Del sends to the Recycle Bin, Shift+Del deletes permanently."/>
           <Grid Margin="10,0,10,10">
             <Grid.ColumnDefinitions>
               <ColumnDefinition Name="colTree" Width="2*" MinWidth="300"/>
@@ -786,6 +850,13 @@ function New-CatXaml([string[]]$cats, [bool]$checked) {
 "@
 
 $Win = [Windows.Markup.XamlReader]::Load([Xml.XmlNodeReader]::new($Xaml))
+# Window + taskbar icon: next to the script (Alpheus.exe unpacks it there) or in assets\ (repo layout).
+foreach ($ico in (Join-Path $PSScriptRoot 'alpheus.ico'), (Join-Path $PSScriptRoot 'assets\alpheus.ico')) {
+    if (Test-Path -LiteralPath $ico) {
+        try { $Win.Icon = [Windows.Media.Imaging.BitmapFrame]::Create([Uri]$ico) } catch { Write-Verbose "icon not loaded: $_" }
+        break
+    }
+}
 $ui = @{}
 foreach ($n in 'lblAdmin', 'lblStatus', 'lblElapsed', 'lblTotals', 'txtAge', 'cbDeep', 'cbResetBase', 'btnAudit', 'btnPreview',
                'btnApply', 'btnStop', 'btnFolder', 'tabs', 'txtLog', 'gridTargets', 'txtFindings',
@@ -1198,7 +1269,15 @@ function Open-InExplorer($n) {
     else { Start-Process explorer.exe -ArgumentList "`"$p`"" }
 }
 
+function Set-BigRows($s) {
+    $ui.gridBig.ItemsSource = @($s.LargestFiles(1000) | ForEach-Object {
+        [pscustomobject]@{ GB = [math]::Round($_.Size / 1GB, 2); Modified = $_.Modified.ToLocalTime().ToString('yyyy-MM-dd')
+                           Type = Get-GroupName $_.Group; Path = $_.FullPath; Node = $_ }
+    })
+}
+
 function Clear-DiskView {
+    Clear-Mark
     $ui.tvDisk.Items.Clear()
     Save-GridColumns 'gridExt'; Save-GridColumns 'gridBig'
     $ui.gridExt.ItemsSource = $null; $ui.gridBig.ItemsSource = $null
@@ -1256,10 +1335,7 @@ function Complete-DiskScan {
         [pscustomobject]@{ Extension = $_.Ext; Type = Get-GroupName $_.Group; GB = [math]::Round($_.Size / 1GB, 2)
                            Percent = [math]::Round(100 * $_.Size / $total, 2); Files = $_.Count }
     })
-    $ui.gridBig.ItemsSource = @($s.LargestFiles(1000) | ForEach-Object {
-        [pscustomobject]@{ GB = [math]::Round($_.Size / 1GB, 2); Modified = $_.Modified.ToLocalTime().ToString('yyyy-MM-dd')
-                           Type = Get-GroupName $_.Group; Path = $_.FullPath; Node = $_ }
-    })
+    Set-BigRows $s
 
     $script:Selected = $root
     Set-TreemapRoot $root
@@ -1291,16 +1367,209 @@ foreach ($g in 1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 10, 11) {
     [void]$ui.pnlLegend.Children.Add($sp)
 }
 
+# ================================================================ Acheron: delete from the Disk usage tab
+# Added 2026-10-04 at the owner's request (the tab was originally read-only by design). Guardrails:
+#   - Delete sends to the Recycle Bin; Shift+Delete is permanent after a second, default-No confirmation.
+#   - One confirmation lists every item and the total before anything moves.
+#   - Refused outright: drive roots, Windows / Recycle Bin / System Volume Information, top-level system
+#     and profile folders, PROTECTED folders (built-ins + alpheus.config.json) and anything CONTAINING one,
+#     the scan root, and the "[N files under 1 MB]" groups. An unreadable config disables delete entirely.
+#   - Installed apps and Steam games get a warning: their own uninstaller is cleaner.
+#   - Every outcome is appended to %LOCALAPPDATA%\Alpheus\deletions.log.
+$script:Marked = [Collections.Generic.HashSet[object]]::new()   # TreeViewItems marked with Ctrl/Shift-click
+$script:Anchor = $null
+$MarkBrush = Get-Brush 0x24405A
+$DeleteLog = Join-Path $env:LOCALAPPDATA 'Alpheus\deletions.log'
+
+# Every Acheron dialog goes through these two, so tests can answer them and read their exact text.
+function Show-DeleteConfirm([string]$text, [string]$title, [string]$icon) {
+    [Windows.MessageBox]::Show($Win, $text, $title, 'YesNo', $icon, 'No') -eq 'Yes'
+}
+function Show-DeleteInfo([string]$text, [string]$icon = 'Information') {
+    [Windows.MessageBox]::Show($Win, $text, 'Alpheus', 'OK', $icon) | Out-Null
+}
+
+function Format-Root([string]$p) { try { [IO.Path]::GetFullPath($p).TrimEnd('\') + '\' } catch { $null } }
+
+function Initialize-DeleteGuard {
+    # Same PROTECTED set as the engine: built-ins plus alpheus.config.json (next to the script, then
+    # %LOCALAPPDATA%\Alpheus). Fail closed: if the config cannot be read, delete is disabled.
+    $script:DeleteBlocked = $null
+    $ollama = if ($env:OLLAMA_MODELS) { $env:OLLAMA_MODELS } else { Join-Path $env:USERPROFILE '.ollama\models' }
+    $roots = [Collections.Generic.List[string]]::new()
+    foreach ($b in (Join-Path $env:USERPROFILE 'Downloads'), $ollama, (Join-Path $env:USERPROFILE '.cache\huggingface'),
+                   (Join-Path $env:USERPROFILE '.cache\torch'), $PSScriptRoot, (Join-Path $env:LOCALAPPDATA 'Alpheus')) {
+        $r = Format-Root $b; if ($r) { $roots.Add($r) }
+    }
+    $cfgPath = @((Join-Path $PSScriptRoot 'alpheus.config.json'), (Join-Path $env:LOCALAPPDATA 'Alpheus\alpheus.config.json')) |
+        Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+    if ($cfgPath) {
+        try {
+            $cfg = Get-Content -LiteralPath $cfgPath -Raw -ErrorAction Stop | ConvertFrom-Json -AsHashtable -ErrorAction Stop
+            foreach ($e in @($cfg['Protected'])) {
+                if ($e -isnot [hashtable] -or -not $e['Paths']) { throw 'each Protected entry needs Name and Paths' }
+                foreach ($raw in @($e['Paths'])) {
+                    $x = [Environment]::ExpandEnvironmentVariables([string]$raw)
+                    if ([string]::IsNullOrWhiteSpace([string]$raw) -or ([string]$raw).Contains([char]0) -or -not [IO.Path]::IsPathFullyQualified($x)) { throw "bad path '$raw'" }
+                    $roots.Add((Format-Root $x))
+                }
+            }
+        } catch { $script:DeleteBlocked = "Delete is disabled: $cfgPath could not be read ($($_.Exception.Message)). Fix the file so Alpheus knows what is PROTECTED." }
+    }
+    $script:ProtectedRoots = @($roots)
+    $script:SystemExact = @($env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramData, (Join-Path $env:SystemDrive 'Users'),
+        $env:USERPROFILE, $env:APPDATA, $env:LOCALAPPDATA, (Join-Path $env:USERPROFILE 'AppData'),
+        [Environment]::GetFolderPath('Desktop'), [Environment]::GetFolderPath('MyDocuments'), [Environment]::GetFolderPath('MyPictures'),
+        [Environment]::GetFolderPath('MyMusic'), [Environment]::GetFolderPath('MyVideos')) |
+        Where-Object { $_ } | ForEach-Object { Format-Root $_ } | Where-Object { $_ }
+    $script:SystemTree = @($env:SystemRoot) | ForEach-Object { Format-Root $_ }
+}
+
+function Get-RefuseReason([string]$path) {
+    $full = [IO.Path]::GetFullPath($path).TrimEnd('\')
+    $p = $full + '\'
+    if ($p -ieq ([IO.Path]::GetPathRoot($full).TrimEnd('\') + '\')) { return 'drive root' }
+    if ($p -match '(?i)\\(\$Recycle\.Bin|System Volume Information)\\') { return 'Recycle Bin / system volume data' }
+    if ([IO.Path]::GetFileName($full) -in 'pagefile.sys', 'hiberfil.sys', 'swapfile.sys') { return 'Windows system file' }
+    foreach ($x in $script:SystemTree) { if ($p.StartsWith($x, [StringComparison]::OrdinalIgnoreCase)) { return 'inside Windows' } }
+    foreach ($x in $script:SystemExact) { if ($p -ieq $x) { return 'top-level system or profile folder' } }
+    foreach ($r in $script:ProtectedRoots) {
+        if ($p.StartsWith($r, [StringComparison]::OrdinalIgnoreCase)) { return 'PROTECTED' }
+        if ($r.StartsWith($p, [StringComparison]::OrdinalIgnoreCase)) { return "contains PROTECTED folder $($r.TrimEnd('\'))" }
+    }
+    $null
+}
+
+function Get-DeleteWarning([string]$path) {
+    if ($path -match '(?i)\\steamapps\\common\\[^\\]+$') { return 'Steam game: uninstalling in Steam is cleaner (deleting the folder leaves Steam thinking it is installed)' }
+    if ($path -match '(?i)\\GOG Galaxy\\Games\\[^\\]+$') { return 'GOG game: uninstalling in GOG Galaxy is cleaner' }
+    foreach ($pf in $env:ProgramFiles, ${env:ProgramFiles(x86)}) {
+        if ($pf -and $path -match ('^(?i)' + [regex]::Escape($pf) + '\\[^\\]+$')) { return 'installed app: Settings > Apps > Uninstall is cleaner (registry, services, shortcuts)' }
+    }
+    $null
+}
+
+function Set-Mark($ti, [bool]$on) {
+    if ($ti -isnot [Windows.Controls.TreeViewItem] -or $null -eq $ti.Tag) { return }
+    if ($on) { [void]$script:Marked.Add($ti) } else { [void]$script:Marked.Remove($ti) }
+    if ($ti.Header -is [Windows.Controls.Grid]) { $ti.Header.Background = $(if ($on) { $MarkBrush } else { $null }) }
+}
+function Clear-Mark { foreach ($ti in @($script:Marked)) { Set-Mark $ti $false }; $script:Marked.Clear() }
+
+function Get-VisibleItem {
+    # Tree items in on-screen order (expanded branches only), for Shift-click ranges.
+    $out = [Collections.Generic.List[object]]::new()
+    $walk = { param($items) foreach ($it in $items) { if ($it -is [Windows.Controls.TreeViewItem] -and $null -ne $it.Tag) { $out.Add($it); if ($it.IsExpanded) { & $walk $it.Items } } } }
+    & $walk $ui.tvDisk.Items
+    , $out
+}
+
+function Get-DeleteTarget([string]$from) {
+    $nodes = switch ($from) {
+        'tree'  { if ($script:Marked.Count) { @($script:Marked | ForEach-Object { $_.Tag }) } else { @($script:Selected) } }
+        'grid'  { @($ui.gridBig.SelectedItems | ForEach-Object { $_.Node }) }
+        default { @($script:Selected) }
+    }
+    $set = [Collections.Generic.HashSet[object]]::new()
+    foreach ($n in $nodes) { if ($null -ne $n) { [void]$set.Add($n) } }
+    # a selected item inside another selected folder goes with its parent
+    @($set | Where-Object { $n = $_; $inside = $false; for ($a = $n.Parent; $null -ne $a; $a = $a.Parent) { if ($set.Contains($a)) { $inside = $true; break } }; -not $inside })
+}
+
+function Invoke-DiskDelete([string]$from, [bool]$permanent) {
+    if ($script:DeleteBlocked) { Show-DeleteInfo $script:DeleteBlocked 'Warning'; return }
+    if (-not $script:Scanner -or -not $script:Scanner.IsCompleted) { return }
+    $ok = [Collections.Generic.List[object]]::new(); $refused = [Collections.Generic.List[string]]::new(); $warn = [Collections.Generic.List[string]]::new()
+    foreach ($n in (Get-DeleteTarget $from)) {
+        $why = if ($n.IsAggregate) { 'a group of small files - open the folder in Explorer to pick them' }
+               elseif ($null -eq $n.Parent) { 'the scan root - select items inside it' }
+               else { Get-RefuseReason $n.FullPath }
+        if ($why) { $refused.Add("  $($n.FullPath)   ($why)"); continue }
+        $ok.Add($n)
+        $w = Get-DeleteWarning $n.FullPath; if ($w) { $warn.Add("  $($n.Name): $w") }
+    }
+    if (-not $ok.Count) {
+        if ($refused.Count) { Show-DeleteInfo "Nothing can be deleted:`n`n$($refused -join "`n")" }
+        return
+    }
+    $total = 0L; foreach ($n in $ok) { $total += $n.Size }
+    $list = @($ok | Select-Object -First 12 | ForEach-Object { '  {0,10}   {1}' -f (Format-Size $_.Size), $_.FullPath })
+    if ($ok.Count -gt 12) { $list += "  ... and $($ok.Count - 12) more" }
+    $verb = if ($permanent) { 'PERMANENTLY DELETE' } else { 'Move to the Recycle Bin' }
+    $msg = "$verb $($ok.Count) item(s), $(Format-Size $total):`n`n$($list -join "`n")"
+    if ($warn.Count) { $msg += "`n`nWorth knowing:`n$($warn -join "`n")" }
+    if ($refused.Count) { $msg += "`n`nWill NOT be touched:`n$($refused -join "`n")" }
+    $msg += if ($permanent) { "`n`nThis cannot be undone." } else { "`n`nRecoverable from the Recycle Bin. Space is freed when you empty it." }
+    $icon = if ($permanent) { 'Stop' } else { 'Warning' }
+    if (-not (Show-DeleteConfirm $msg 'Alpheus - confirm delete' $icon)) { return }
+    if ($permanent -and -not (Show-DeleteConfirm "Permanently delete $($ok.Count) item(s), $(Format-Size $total)?`n`nThere will be no Recycle Bin copy." 'Alpheus - permanent delete' 'Stop')) { return }
+
+    $hwnd = [Windows.Interop.WindowInteropHelper]::new($Win).Handle
+    $aborted = $false
+    $rc = [Alpheus.Acheron]::Delete($hwnd, [string[]]@($ok | ForEach-Object { $_.FullPath }), $permanent, [ref]$aborted)
+    $mode = if ($permanent) { 'PERMANENT' } else { 'RECYCLE' }
+    $done = 0; $doneBytes = 0L; $failed = [Collections.Generic.List[string]]::new()
+    $null = New-Item -ItemType Directory -Path (Split-Path $DeleteLog) -Force -ErrorAction SilentlyContinue
+    foreach ($n in $ok) {
+        $gone = -not (Test-Path -LiteralPath $n.FullPath)
+        try { Add-Content -LiteralPath $DeleteLog -Value ("{0}`t{1}`t{2}`t{3}`t{4}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $mode, $(if ($gone) { 'OK' } else { 'NOT-DELETED' }), $n.Size, $n.FullPath) } catch { Write-Verbose "deletions.log: $_" }
+        if ($gone) { $done++; $doneBytes += $n.Size; [Alpheus.Scanner]::Detach($n) } else { $failed.Add($n.FullPath) }
+    }
+    Update-AfterDelete
+    $what = if ($permanent) { 'deleted permanently' } else { 'moved to the Recycle Bin' }
+    $ui.lblStatus.Text = "Disk usage: $done item(s), $(Format-Size $doneBytes) $what$(if ($failed.Count) { "; $($failed.Count) not deleted" })$(if ($aborted) { ' (cancelled in Windows)' }). Log: $DeleteLog"
+    if ($failed.Count -and -not $aborted) {
+        Show-DeleteInfo "Not deleted (in use, access denied, or skipped in Windows' dialog; code $rc):`n`n$($failed -join "`n")" 'Warning'
+    }
+}
+
+function Update-AfterDelete {
+    # Rebuild the tree from the (now smaller) node graph, keeping what was expanded; refresh grid + treemap.
+    $root = $script:Scanner.Root
+    $expanded = [Collections.Generic.HashSet[object]]::new()
+    $walk = { param($items) foreach ($it in $items) { if ($it -is [Windows.Controls.TreeViewItem] -and $it.IsExpanded -and $null -ne $it.Tag) { [void]$expanded.Add($it.Tag); & $walk $it.Items } } }
+    & $walk $ui.tvDisk.Items
+    Clear-Mark; $script:Anchor = $null
+    $ui.tvDisk.Items.Clear()
+    $top = New-NodeItem $root $root.Size
+    [void]$ui.tvDisk.Items.Add($top)
+    $open = { param($ti) if ($expanded.Contains($ti.Tag)) { Expand-NodeItem $ti; $ti.IsExpanded = $true; foreach ($c in @($ti.Items)) { if ($c -is [Windows.Controls.TreeViewItem] -and $null -ne $c.Tag) { & $open $c } } } }
+    & $open $top
+    Sync-TreeHeaderOffset
+    Set-BigRows $script:Scanner
+    $tmr = $script:TmRoot
+    while ($tmr -and -not [Alpheus.Scanner]::IsAttached($tmr, $root)) { $tmr = $tmr.Parent }
+    if (-not $script:Selected -or -not [Alpheus.Scanner]::IsAttached($script:Selected, $root)) { $script:Selected = $tmr }
+    Set-TreemapRoot $(if ($tmr) { $tmr } else { $root })
+    $ui.lblTm.Text = Get-NodeLabel $script:Selected
+    if ($ui.lblScan.Text -notmatch 'Extensions tab updates on rescan') { $ui.lblScan.Text += '   |   items deleted: Extensions tab updates on rescan' }
+}
+
+function Get-MenuSource($menuItem) {
+    $t = if ($menuItem.Parent -is [Windows.Controls.ContextMenu]) { $menuItem.Parent.PlacementTarget } else { $null }
+    if ([object]::ReferenceEquals($t, $ui.tvDisk)) { 'tree' } elseif ([object]::ReferenceEquals($t, $ui.gridBig)) { 'grid' } else { 'treemap' }
+}
+function Get-MenuNode($menuItem) {
+    if ((Get-MenuSource $menuItem) -eq 'grid') { $r = $ui.gridBig.SelectedItem; if ($r) { return $r.Node } }
+    $script:Selected
+}
+
 function New-DiskMenu {
     $m = [Windows.Controls.ContextMenu]::new()
     $items = [ordered]@{
-        'Open in Explorer'   = { Open-InExplorer $script:Selected }
-        'Copy path'          = { if ($script:Selected) { [Windows.Clipboard]::SetText($script:Selected.FullPath) } }
-        'Zoom treemap here'  = { Set-TreemapRoot (Get-DirOf $script:Selected) }
-        'Rescan this folder' = { $d = Get-DirOf $script:Selected; if ($d) { $ui.txtRoot.Text = $d.FullPath; Start-DiskScan $d.FullPath } }
+        'Open in Explorer'   = { param($s) Open-InExplorer (Get-MenuNode $s) }
+        'Copy path'          = { param($s) $n = Get-MenuNode $s; if ($n) { [Windows.Clipboard]::SetText($n.FullPath) } }
+        'Zoom treemap here'  = { param($s) Set-TreemapRoot (Get-DirOf (Get-MenuNode $s)) }
+        'Rescan this folder' = { param($s) $d = Get-DirOf (Get-MenuNode $s); if ($d) { $ui.txtRoot.Text = $d.FullPath; Start-DiskScan $d.FullPath } }
+        '-'                  = $null
+        'Delete'             = { param($s) Invoke-DiskDelete (Get-MenuSource $s) $false }
+        'Delete permanently...' = { param($s) Invoke-DiskDelete (Get-MenuSource $s) $true }
     }
     foreach ($k in $items.Keys) {
-        $mi = [Windows.Controls.MenuItem]::new(); $mi.Header = $k; $mi.Add_Click($items[$k]); [void]$m.Items.Add($mi)
+        if ($k -eq '-') { [void]$m.Items.Add([Windows.Controls.Separator]::new()); continue }
+        $mi = [Windows.Controls.MenuItem]::new(); $mi.Header = $k; $mi.Add_Click($items[$k])
+        if ($k -eq 'Delete') { $mi.InputGestureText = 'Del' } elseif ($k -like 'Delete perm*') { $mi.InputGestureText = 'Shift+Del' }
+        [void]$m.Items.Add($mi)
     }
     $m
 }
@@ -1319,6 +1588,9 @@ if ($script:ScanLoadError) {
 } else {
     $ui.tvDisk.ContextMenu = New-DiskMenu
     $ui.imgTreemap.ContextMenu = New-DiskMenu
+    $ui.gridBig.ContextMenu = New-DiskMenu
+    $ui.gridBig.SelectionMode = 'Extended'
+    Initialize-DeleteGuard
 
     $ui.btnScan.Add_Click({ Start-DiskScan $ui.txtRoot.Text })
     $ui.txtRoot.Add_KeyDown({ param($s, $e) if ($e.Key -eq 'Return') { Start-DiskScan $ui.txtRoot.Text } })
@@ -1347,7 +1619,33 @@ if ($script:ScanLoadError) {
     })
     $ui.tvDisk.Add_PreviewMouseRightButtonDown({ param($s, $e)
         $ti = Get-AncestorItem $e.OriginalSource
-        if ($ti) { $ti.IsSelected = $true; [void]$ti.Focus() }
+        if ($ti) {
+            # right-click inside the marked set keeps it; elsewhere it marks just that item
+            if (-not $script:Marked.Contains($ti)) { Clear-Mark; Set-Mark $ti $true; $script:Anchor = $ti }
+            $ti.IsSelected = $true; [void]$ti.Focus()
+        }
+    })
+    $ui.tvDisk.Add_PreviewMouseLeftButtonDown({ param($s, $e)
+        # Ctrl+click toggles, Shift+click marks a range, plain click marks one; the expander arrow is left alone
+        for ($d = $e.OriginalSource; $null -ne $d -and $d -isnot [Windows.Controls.TreeViewItem];
+             $d = $(if ($d -is [Windows.Media.Visual]) { [Windows.Media.VisualTreeHelper]::GetParent($d) } else { [Windows.LogicalTreeHelper]::GetParent($d) })) {
+            if ($d -is [Windows.Controls.Primitives.ToggleButton]) { return }
+        }
+        $ti = Get-AncestorItem $e.OriginalSource
+        if (-not $ti -or $null -eq $ti.Tag) { return }
+        $mods = [Windows.Input.Keyboard]::Modifiers
+        if ($mods -band [Windows.Input.ModifierKeys]::Control) { Set-Mark $ti (-not $script:Marked.Contains($ti)); $script:Anchor = $ti }
+        elseif (($mods -band [Windows.Input.ModifierKeys]::Shift) -and $script:Anchor) {
+            $vis = Get-VisibleItem; $a = $vis.IndexOf($script:Anchor); $b = $vis.IndexOf($ti)
+            if ($a -ge 0 -and $b -ge 0) { Clear-Mark; foreach ($i in [math]::Min($a, $b)..[math]::Max($a, $b)) { Set-Mark $vis[$i] $true } }
+        }
+        else { Clear-Mark; Set-Mark $ti $true; $script:Anchor = $ti }
+    })
+    $ui.tvDisk.Add_KeyDown({ param($s, $e)
+        if ($e.Key -eq 'Delete') { Invoke-DiskDelete 'tree' ([bool]([Windows.Input.Keyboard]::Modifiers -band [Windows.Input.ModifierKeys]::Shift)); $e.Handled = $true }
+    })
+    $ui.gridBig.Add_PreviewKeyDown({ param($s, $e)
+        if ($e.Key -eq 'Delete') { Invoke-DiskDelete 'grid' ([bool]([Windows.Input.Keyboard]::Modifiers -band [Windows.Input.ModifierKeys]::Shift)); $e.Handled = $true }
     })
     $ui.tvDisk.Add_MouseDoubleClick({ param($s, $e)
         $ti = Get-AncestorItem $e.OriginalSource

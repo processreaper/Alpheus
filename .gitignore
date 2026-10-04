@@ -1,2 +1,6 @@
 # Your own protected folders: machine-specific, never published.
 alpheus.config.json
+
+# build output
+dist/
+obj/

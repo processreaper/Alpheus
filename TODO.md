@@ -9,7 +9,8 @@
   scaled monitor may reopen at the default position. Use per-monitor DPI.
 - **"Freed" for DevCaches overstates** when uv has hardlinked cache files into environments.
   Report the volume free-space delta alongside the per-category count.
-- **DataGrid column drag-to-reorder** has been tested with simulated drag events and by hand for
-  resizing, but reordering has not had a real-mouse pass.
+- **Alpheus.exe is unsigned**, so SmartScreen warns on first run and some antivirus heuristics may
+  flag a downloaded launcher that requests elevation. Sign it (SignPath offers free signing to
+  open-source projects; Azure Trusted Signing is the paid route).
 - Lint with PSScriptAnalyzer before each release.
-- Optional later: PowerShell Gallery (`Install-Script`), code signing.
+- Optional later: PowerShell Gallery (`Install-Script`).
