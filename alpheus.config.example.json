@@ -1,0 +1,6 @@
+{
+  "Protected": [
+    { "Name": "AI models", "Paths": ["D:\\Models", "%USERPROFILE%\\.lmstudio\\models"], "Note": "prune by hand", "Breakdown": true },
+    { "Name": "Notes vault", "Paths": ["%USERPROFILE%\\Documents\\Vault"], "Note": "never cleaned" }
+  ]
+}
