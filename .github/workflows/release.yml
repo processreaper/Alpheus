@@ -19,7 +19,7 @@ jobs:
   build:
     runs-on: windows-latest   # GitHub-hosted: required for SignPath origin verification
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Version
         id: ver
@@ -42,7 +42,7 @@ jobs:
 
       - name: Upload unsigned build
         id: upload
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: Alpheus-unsigned
           path: dist/Alpheus.exe
@@ -81,7 +81,7 @@ jobs:
 
       - name: Keep build (manual runs)
         if: ${{ github.ref_type != 'tag' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: Alpheus-build
           path: out/
