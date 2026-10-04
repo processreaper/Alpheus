@@ -95,7 +95,9 @@ jobs:
           $tag = $env:GITHUB_REF_NAME
           $note = if ('${{ steps.files.outputs.signed }}' -eq 'True') { 'Alpheus.exe is code-signed (SignPath Foundation).' }
                   else { 'Alpheus.exe is not code-signed yet: Windows SmartScreen asks once; choose More info > Run anyway.' }
-          $body = "$note`n`nBuilt from $env:GITHUB_SHA by GitHub Actions run $env:GITHUB_RUN_ID.`n`nSHA-256:`n``````n$(Get-Content out/SHA256SUMS.txt -Raw)``````"
+          $fence = '```'   # single-quoted: backticks are PowerShell's escape character inside double quotes
+          $body = @($note, '', "Built from $env:GITHUB_SHA by GitHub Actions run $env:GITHUB_RUN_ID.", '', 'SHA-256:',
+                    $fence, (Get-Content out/SHA256SUMS.txt -Raw).TrimEnd(), $fence) -join "`n"
           gh release view $tag 2>$null
           if ($LASTEXITCODE -eq 0) { gh release upload $tag out/* --clobber }
           else { gh release create $tag out/* --title "Alpheus $tag" --notes $body --verify-tag }
