@@ -8,7 +8,8 @@
 //      unelevated with partial results, as the script does;
 //   4. starts the GUI with no console window, then exits.
 //
-// Switches: --no-elevate  skip the UAC request.  (--elevated is internal: marks the relaunched copy.)
+// Switches: --no-elevate  skip the UAC request.  --uninstall  remove %LOCALAPPDATA%\Alpheus (asks first).
+//           (--elevated is internal: marks the relaunched copy.)
 // ALPHEUS_PWSH overrides the pwsh.exe path (used by tests).
 // Targets .NET Framework 4.8, which ships with Windows 10/11, so the .exe needs nothing installed.
 
@@ -33,6 +34,7 @@ static class AlpheusLauncher
     {
         try
         {
+            if (args.Contains("--uninstall", StringComparer.OrdinalIgnoreCase)) return Uninstall();
             bool noElevate = args.Contains("--no-elevate", StringComparer.OrdinalIgnoreCase);
             bool relaunched = args.Contains("--elevated", StringComparer.OrdinalIgnoreCase);
 
@@ -68,6 +70,38 @@ static class AlpheusLauncher
             MessageBox.Show("Alpheus could not start:\n\n" + e.Message, "Alpheus", MessageBoxButtons.OK, MessageBoxIcon.Error);
             return 2;
         }
+    }
+
+    // Alpheus installs nothing system-wide: no registry keys, services, scheduled tasks or shortcuts.
+    // Everything lives under %LOCALAPPDATA%\Alpheus. Removes the unpacked app always, and logs, layout and
+    // config only if the user says so; the .exe itself is deleted by the user.
+    static int Uninstall()
+    {
+        string root = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Alpheus");
+        if (!Directory.Exists(root))
+        {
+            MessageBox.Show("Nothing to remove: " + root + " does not exist.\n\nDelete Alpheus.exe to finish.", "Alpheus - uninstall");
+            return 0;
+        }
+        var r = MessageBox.Show(
+            "Remove Alpheus from this PC?\n\nThe unpacked program in\n    " + Path.Combine(root, "app") + "\nwill be removed.\n\n" +
+            "Also remove your reports, delete log, window layout and alpheus.config.json in\n    " + root + " ?\n\n" +
+            "Yes = remove everything   No = keep reports and settings   Cancel = do nothing",
+            "Alpheus - uninstall", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2);
+        if (r == DialogResult.Cancel) return 1;
+        try
+        {
+            if (r == DialogResult.Yes) Directory.Delete(root, true);
+            else if (Directory.Exists(Path.Combine(root, "app"))) Directory.Delete(Path.Combine(root, "app"), true);
+        }
+        catch (Exception e)
+        {
+            MessageBox.Show("Could not remove everything (is Alpheus still open?):\n\n" + e.Message, "Alpheus - uninstall", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return 2;
+        }
+        MessageBox.Show("Alpheus has been removed" + (r == DialogResult.Yes ? "." : "; your reports and settings were kept in " + root + ".") +
+            "\n\nDelete Alpheus.exe to finish.", "Alpheus - uninstall", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        return 0;
     }
 
     static bool IsAdmin()

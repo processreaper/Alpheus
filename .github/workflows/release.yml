@@ -1,0 +1,101 @@
+# Builds Alpheus.exe and the script zip from source on GitHub-hosted runners, so every published binary
+# traces back to a commit (a SignPath Foundation requirement). Signing runs only once the repository has
+# SignPath settings: variables SIGNPATH_ORGANIZATION_ID / SIGNPATH_PROJECT_SLUG / SIGNPATH_POLICY_SLUG and
+# secret SIGNPATH_API_TOKEN. Until then the release ships unsigned, as before.
+#
+#   push a tag vX.Y.Z      -> lint, build, (sign), publish GitHub release vX.Y.Z
+#   Run workflow (manual)  -> lint, build, (sign), keep the binaries as a workflow artifact; publishes nothing
+name: build-and-release
+
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+  workflow_dispatch:
+
+permissions:
+  contents: write   # create the release on tag builds
+
+jobs:
+  build:
+    runs-on: windows-latest   # GitHub-hosted: required for SignPath origin verification
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version
+        id: ver
+        shell: pwsh
+        run: |
+          $v = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME.TrimStart('v') } else { '0.0.0' }
+          "version=$v" >> $env:GITHUB_OUTPUT
+
+      - name: Lint (PSScriptAnalyzer)
+        shell: pwsh
+        run: |
+          Install-Module PSScriptAnalyzer -Scope CurrentUser -Force
+          $r = Invoke-ScriptAnalyzer -Path . -Recurse -Settings ./PSScriptAnalyzerSettings.psd1
+          $r | Format-Table ScriptName, Line, RuleName, Message -AutoSize -Wrap
+          if ($r) { throw "PSScriptAnalyzer: $(@($r).Count) finding(s)" }
+
+      - name: Build Alpheus.exe
+        shell: pwsh
+        run: ./tools/Build-AlpheusExe.ps1 -Version ${{ steps.ver.outputs.version }}
+
+      - name: Upload unsigned build
+        id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: Alpheus-unsigned
+          path: dist/Alpheus.exe
+          if-no-files-found: error
+
+      - name: Sign with SignPath
+        if: ${{ vars.SIGNPATH_ORGANIZATION_ID != '' }}
+        uses: signpath/github-action-submit-signing-request@v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_POLICY_SLUG }}
+          github-artifact-id: ${{ steps.upload.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: signed
+
+      - name: Assemble release files
+        id: files
+        shell: pwsh
+        run: |
+          $v = '${{ steps.ver.outputs.version }}'
+          $null = New-Item -ItemType Directory out -Force
+          $signed = Test-Path signed/Alpheus.exe
+          Copy-Item $(if ($signed) { 'signed/Alpheus.exe' } else { 'dist/Alpheus.exe' }) out/Alpheus.exe
+          if ($signed) {
+            $sig = Get-AuthenticodeSignature out/Alpheus.exe
+            if ($sig.Status -ne 'Valid') { throw "signed Alpheus.exe does not verify: $($sig.Status)" }
+            "signed by: $($sig.SignerCertificate.Subject)"
+          }
+          git archive --format=zip --prefix=Alpheus/ -o "out/Alpheus-v$v.zip" HEAD
+          $sums = Get-ChildItem out | ForEach-Object { '{0}  {1}' -f (Get-FileHash $_.FullName).Hash.ToLower(), $_.Name }
+          $sums | Set-Content out/SHA256SUMS.txt
+          $sums
+          "signed=$signed" >> $env:GITHUB_OUTPUT
+
+      - name: Keep build (manual runs)
+        if: ${{ github.ref_type != 'tag' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: Alpheus-build
+          path: out/
+
+      - name: Publish release (tags)
+        if: ${{ github.ref_type == 'tag' }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $note = if ('${{ steps.files.outputs.signed }}' -eq 'True') { 'Alpheus.exe is code-signed (SignPath Foundation).' }
+                  else { 'Alpheus.exe is not code-signed yet: Windows SmartScreen asks once; choose More info > Run anyway.' }
+          $body = "$note`n`nBuilt from $env:GITHUB_SHA by GitHub Actions run $env:GITHUB_RUN_ID.`n`nSHA-256:`n``````n$(Get-Content out/SHA256SUMS.txt -Raw)``````"
+          gh release view $tag 2>$null
+          if ($LASTEXITCODE -eq 0) { gh release upload $tag out/* --clobber }
+          else { gh release create $tag out/* --title "Alpheus $tag" --notes $body --verify-tag }

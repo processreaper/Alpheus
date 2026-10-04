@@ -171,6 +171,43 @@ icon and repair of a tampered unpacked file.
 The launcher (`launcher\AlpheusLauncher.cs`) targets .NET Framework 4.8 and is compiled with the
 C# compiler that ships with Windows, so no SDK is needed.
 
+## Uninstall
+
+Alpheus installs nothing system-wide: no registry entries, services, scheduled tasks or shortcuts.
+Everything it writes lives in `%LOCALAPPDATA%\Alpheus` (the unpacked program, reports, the delete
+log, window layout and your config).
+
+```
+Alpheus.exe --uninstall
+```
+
+removes the unpacked program and asks whether to remove your reports and settings too. Then delete
+`Alpheus.exe`. If you used the scripts, delete their folder and, optionally, `%LOCALAPPDATA%\Alpheus`.
+
+Changes Alpheus can make to your system happen only when you ask for them (*Apply*, or a delete on
+the Disk usage tab), each behind a confirmation. Turning hibernation off (`powercfg /hibernate off`)
+is undone with `powercfg /hibernate on`.
+
+## Code signing policy
+
+Release binaries are built from this repository by GitHub Actions
+(`.github/workflows/release.yml`) on GitHub-hosted runners, never on a developer machine.
+
+Alpheus has not yet been accepted for free code signing. Once it is, this section will read:
+*Free code signing provided by [SignPath.io](https://about.signpath.io), certificate by
+[SignPath Foundation](https://signpath.org).* Until then `Alpheus.exe` is unsigned.
+
+Team roles:
+
+- Committers and reviewers: [processreaper](https://github.com/processreaper)
+- Approvers: [processreaper](https://github.com/processreaper)
+
+Privacy: this program will not transfer any information to other networked systems unless
+specifically requested by the user or the person installing or operating it. Its only network
+actions: opening the PowerShell download page in your browser, if you choose that when PowerShell 7
+is missing; and, if Ollama is installed, running `ollama list` to show your local models (which asks
+your own Ollama server, normally on this PC). Reports and logs stay in `%LOCALAPPDATA%\Alpheus`.
+
 ## License
 
 MIT — see `LICENSE`.
